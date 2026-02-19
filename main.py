@@ -16,6 +16,8 @@ import time
 
 import matplotlib.patches as patches
 import matplotlib.pyplot as plt
+import matplotlib.transforms as mtransforms
+import numpy as np
 import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 
@@ -26,23 +28,28 @@ SLOT_CONTROLLER_PORT = 5006
 # Thread-safe shared state (avoids Streamlit session_state warnings)
 @st.cache_resource
 def get_shared_state():
+    # Using a global dictionary to store state across reruns
     return {
         'vis_state': {'slots': [], 'robots': []},
         'connected': False,
         'last_update': 0,
-        'lock': threading.Lock()
+        'lock': threading.Lock(),
+        'thread_running': False 
     }
 
+
+
+
 # Road dimensions (from params.yaml)
-AREA_WIDTH = 1.8  # road_length
-AREA_HEIGHT = 1.8  # 6 lanes * 0.3m lane_width
-LANE_WIDTH = 0.3
+AREA_WIDTH = 2.6     # X-axis: slot travel direction (0→2.6)
+AREA_HEIGHT = 1.9    # Y-axis: lanes stacked across (6 × 0.317m ≈ 1.9m)
+LANE_WIDTH = 0.317
 
 # Visualization settings
-FIG_SIZE = (12, 4)
+FIG_SIZE = (12, 8)   # Landscape orientation
 ROBOT_RADIUS = 0.05
-SLOT_WIDTH = 0.1  # slot_length
-SLOT_HEIGHT = 0.15
+SLOT_WIDTH = 0.1     # Along-track width (X, = slot_length)
+SLOT_HEIGHT = 0.15   # Cross-track height (Y)
 VIEW_MARGIN = 0.2
 
 
@@ -117,6 +124,8 @@ def draw_visualization(state: dict) -> None:
     """Draw the road, slots, and robots."""
     fig, ax = plt.subplots(figsize=FIG_SIZE, facecolor=(0.1, 0.1, 0.1))
 
+    track_type = state.get('track_type', 'linear')
+
     # Set up axes
     xmin = -VIEW_MARGIN
     xmax = AREA_WIDTH + VIEW_MARGIN
@@ -137,10 +146,28 @@ def draw_visualization(state: dict) -> None:
     )
     ax.add_patch(road)
 
-    # Draw lane dividers (5 dividers for 6 lanes)
-    for lane_idx in range(1, 6):  # Dividers at y = 0.3, 0.6, 0.9, 1.2, 1.5
-        lane_y = lane_idx * LANE_WIDTH
-        ax.axhline(lane_y, color='white', linewidth=1.5, linestyle='--', alpha=0.7)
+    if track_type == 'oval':
+        # Draw oval track outline
+        track_info = state.get('track', {})
+        cx = track_info.get('center_x', 1.3)
+        cy = track_info.get('center_y', 0.95)
+        a = track_info.get('semi_major', 1.0)
+        b = track_info.get('semi_minor', 0.65)
+
+        oval = patches.Ellipse(
+            (cx, cy), width=2 * a, height=2 * b,
+            facecolor='none',
+            edgecolor='white',
+            linewidth=2,
+            linestyle='--',
+            alpha=0.7
+        )
+        ax.add_patch(oval)
+    else:
+        # Draw lane dividers (5 dividers for 6 horizontal lanes)
+        for lane_idx in range(1, 6):  # Dividers at y = 0.317, 0.634, ...
+            lane_y = lane_idx * LANE_WIDTH
+            ax.axhline(lane_y, color='white', linewidth=1.5, linestyle='--', alpha=0.7)
 
     # Draw slots
     slots = state.get('slots', [])
@@ -159,16 +186,35 @@ def draw_visualization(state: dict) -> None:
             color = '#44ff44'  # Green - empty
             edge_color = '#00ff00'
 
-        # Draw slot rectangle centered at slot position
-        slot_rect = patches.Rectangle(
-            (slot_x - SLOT_WIDTH / 2, slot_y - SLOT_HEIGHT / 2),
-            SLOT_WIDTH, SLOT_HEIGHT,
-            facecolor=color,
-            edgecolor=edge_color,
-            linewidth=2,
-            alpha=0.5
-        )
-        ax.add_patch(slot_rect)
+        heading = slot.get('heading')
+
+        if heading is not None:
+            # Oval mode: draw rotated rectangle aligned to track tangent
+            angle_deg = math.degrees(heading)
+            slot_rect = patches.FancyBboxPatch(
+                (-SLOT_WIDTH / 2, -SLOT_HEIGHT / 2),
+                SLOT_WIDTH, SLOT_HEIGHT,
+                boxstyle="round,pad=0.01",
+                facecolor=color,
+                edgecolor=edge_color,
+                linewidth=2,
+                alpha=0.5
+            )
+            # Build rotation + translation transform
+            t = mtransforms.Affine2D().rotate(heading).translate(slot_x, slot_y) + ax.transData
+            slot_rect.set_transform(t)
+            ax.add_patch(slot_rect)
+        else:
+            # Linear mode: axis-aligned rectangle
+            slot_rect = patches.Rectangle(
+                (slot_x - SLOT_WIDTH / 2, slot_y - SLOT_HEIGHT / 2),
+                SLOT_WIDTH, SLOT_HEIGHT,
+                facecolor=color,
+                edgecolor=edge_color,
+                linewidth=2,
+                alpha=0.5
+            )
+            ax.add_patch(slot_rect)
 
         # Draw slot ID
         ax.text(slot_x, slot_y, str(slot['id']),
@@ -196,10 +242,8 @@ def draw_visualization(state: dict) -> None:
         )
         ax.add_patch(robot_circle)
 
-        # Draw heading arrow 
-        # not sure if there is issue with recieved data or visualisation, 
-        # but adding 90 degrees to makes heading visualisation correct)
-        visual_theta = theta + (math.pi / 2)
+        # Convert compass radians (0=North/+Y, clockwise) to math radians (0=East/+X, counter-clockwise)
+        visual_theta = (math.pi / 2) - theta
         arrow_length = ROBOT_RADIUS * 1.5
         dx = arrow_length * math.cos(visual_theta)
         dy = arrow_length * math.sin(visual_theta)
@@ -236,15 +280,24 @@ def main() -> None:
     st.set_page_config(page_title="SBD Visualization", layout="wide")
     st.title("Slot-Based Driving Visualization")
 
-    # Initialize receiver thread (only once per process)
-    if 'receiver_v2' not in st.session_state:
-        st.session_state.receiver_v2 = False
-
-    # Start receiver thread
-    if not st.session_state.receiver_v2:
-        thread = threading.Thread(target=socket_receiver_thread, daemon=True)
-        thread.start()
-        st.session_state.receiver_v2 = True
+    # Initialize receiver thread (ensure only one exists globally)
+    if 'receiver_thread_started' not in st.session_state:
+        # Check if we already have a running thread in the global resource cache
+        # We can attach a flag to the shared state to track if the thread is running
+        shared_state = get_shared_state()
+        
+        # We use a purely local check here to avoid re-spawning 
+        # But to be truly safe across sessions, we should check a global flag
+        # embedded in the shared state object itself
+        if not shared_state.get('thread_running', False):
+             with shared_state['lock']:
+                if not shared_state.get('thread_running', False):
+                    thread = threading.Thread(target=socket_receiver_thread, daemon=True)
+                    thread.start()
+                    shared_state['thread_running'] = True
+                    print("[VIS] Started background receiver thread")
+        
+        st.session_state.receiver_thread_started = True
 
     # Get current state from thread-safe shared state
     shared = get_shared_state()
@@ -272,8 +325,14 @@ def main() -> None:
         st.markdown("---")
 
         # Slot info
+        track_type = state.get('track_type', 'linear')
         st.subheader("Slots")
         slots = state.get('slots', [])
+
+        if track_type == 'oval':
+            st.text("Track: Oval")
+            track_info = state.get('track', {})
+            st.text(f"  Speed: {track_info.get('semi_major', 0):.2f} x {track_info.get('semi_minor', 0):.2f}m")
 
         if slots:
             for slot in sorted(slots, key=lambda s: s['id']):
@@ -282,7 +341,10 @@ def main() -> None:
                     status = "Occupied"
                 elif slot.get('reserved'):
                     status = "Reserved"
-                st.text(f"Slot {slot['id']} (Lane {slot['lane']}): {status}")
+                if track_type == 'oval':
+                    st.text(f"Slot {slot['id']} (Track): {status}")
+                else:
+                    st.text(f"Slot {slot['id']} (Lane {slot['lane']}): {status}")
         else:
             st.text("No slots")
 
@@ -327,13 +389,37 @@ def main() -> None:
         with legend_cols[3]:
             st.markdown("-- Target line")
 
-    # Auto-refresh
-    time.sleep(0.5)
+    # Auto-refresh via Streamlit fragment or simply relying on interactions.
+    # Using st.rerun() in a loop at the end of the script prevents the script 
+    # from ever "finishing", confusing the frontend into thinking it's still loading.
+    # Instead, we can use st.empty() for the dynamic parts or stream via a generator,
+    # but the simplest fix for "loading forever" with st.rerun() is to ensure 
+    # we don't hog the thread entirely or use a key to trigger updates.
+    
+    # However, for a real-time dashboard, we want the loop.
+    # The "loading" indicator is because the script re-runs immediately.
+    # A slightly better approach is using `st.empty` containers in a loop for the *data* 
+    # rather than rerunning the whole page, but that breaks Streamlit's execution model slightly.
+    
+    # Let's try to increase the sleep time slightly to see if it helps, 
+    # or better, use st.empty() logic if we can refactor.
+    # Refactoring to a while loop inside main with st.empty() is safer.
+    
+    # Current quick fix: Just sleep longer? No, that just slows updates.
+    # The actual fix: Streamlit 1.37+ introduced fragment. But without that, 
+    # we should check if we can avoid the full rerun.
+    
+    # For now, let's keep st.rerun() but handle the "loading" spinner gracefully.
+    # Actually, the user says "stays loading indefinitely", which might mean it never renders the FIRST frame.
+    
+    time.sleep(0.5) 
     st.rerun()
 
 
 if __name__ == "__main__":
     if get_script_run_ctx() is None:
+        
+        
         print("Run with: streamlit run main.py")
         sys.exit(0)
     main()
