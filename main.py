@@ -146,6 +146,8 @@ def draw_visualization(state: dict) -> None:
     )
     ax.add_patch(road)
 
+    slots = state.get('slots', [])
+
     if track_type == 'oval':
         # Draw oval track outline
         track_info = state.get('track', {})
@@ -164,19 +166,28 @@ def draw_visualization(state: dict) -> None:
         )
         ax.add_patch(oval)
     else:
-        # Draw lane dividers (5 dividers for 6 horizontal lanes)
-        for lane_idx in range(1, 6):  # Dividers at y = 0.317, 0.634, ...
-            lane_y = lane_idx * LANE_WIDTH
-            ax.axhline(lane_y, color='white', linewidth=1.5, linestyle='--', alpha=0.7)
+        # Draw lane dividers dynamically from the actual slot y-positions in state
+        slot_ys = sorted(set(slot['y'] for slot in slots))
+        half_lane = LANE_WIDTH / 2
+        if slot_ys:
+            # Outer boundary lines above top lane and below bottom lane
+            ax.axhline(slot_ys[0] - half_lane, color='white', linewidth=1.5, linestyle='-', alpha=0.5)
+            ax.axhline(slot_ys[-1] + half_lane, color='white', linewidth=1.5, linestyle='-', alpha=0.5)
+        # Dividers between adjacent lanes
+        for i in range(len(slot_ys) - 1):
+            divider_y = (slot_ys[i] + slot_ys[i + 1]) / 2
+            ax.axhline(divider_y, color='white', linewidth=1.5, linestyle='--', alpha=0.7)
 
     # Draw slots
-    slots = state.get('slots', [])
     for slot in slots:
         slot_x = slot['x']
         slot_y = slot['y']
 
         # Determine slot color based on status
-        if slot.get('filled', False):
+        if slot.get('paused', False):
+            color = '#888888'  # Gray - paused at turnaround
+            edge_color = '#aaaaaa'
+        elif slot.get('filled', False):
             color = '#ff4444'  # Red - occupied
             edge_color = '#ff0000'
         elif slot.get('reserved', False):
@@ -189,8 +200,7 @@ def draw_visualization(state: dict) -> None:
         heading = slot.get('heading')
 
         if heading is not None:
-            # Oval mode: draw rotated rectangle aligned to track tangent
-            angle_deg = math.degrees(heading)
+            # Draw rotated rectangle aligned to slot heading (oval and linear ping-pong)
             slot_rect = patches.FancyBboxPatch(
                 (-SLOT_WIDTH / 2, -SLOT_HEIGHT / 2),
                 SLOT_WIDTH, SLOT_HEIGHT,
@@ -204,8 +214,17 @@ def draw_visualization(state: dict) -> None:
             t = mtransforms.Affine2D().rotate(heading).translate(slot_x, slot_y) + ax.transData
             slot_rect.set_transform(t)
             ax.add_patch(slot_rect)
+            # Direction arrow (skip when paused)
+            if not slot.get('paused', False):
+                arrow_len = SLOT_WIDTH * 0.55
+                adx = arrow_len * math.cos(heading)
+                ady = arrow_len * math.sin(heading)
+                ax.annotate('', xy=(slot_x + adx, slot_y + ady),
+                            xytext=(slot_x - adx, slot_y - ady),
+                            arrowprops=dict(arrowstyle='->', color='white',
+                                            lw=1.2, mutation_scale=10))
         else:
-            # Linear mode: axis-aligned rectangle
+            # Legacy axis-aligned rectangle (should not occur with ping-pong enabled)
             slot_rect = patches.Rectangle(
                 (slot_x - SLOT_WIDTH / 2, slot_y - SLOT_HEIGHT / 2),
                 SLOT_WIDTH, SLOT_HEIGHT,
@@ -379,7 +398,7 @@ def main() -> None:
         draw_visualization(state)
 
         # Legend
-        legend_cols = st.columns(4)
+        legend_cols = st.columns(5)
         with legend_cols[0]:
             st.markdown(":green_circle: Empty slot")
         with legend_cols[1]:
@@ -387,6 +406,8 @@ def main() -> None:
         with legend_cols[2]:
             st.markdown(":red_circle: Occupied slot")
         with legend_cols[3]:
+            st.markdown(":white_circle: Paused slot")
+        with legend_cols[4]:
             st.markdown("-- Target line")
 
     # Auto-refresh via Streamlit fragment or simply relying on interactions.
