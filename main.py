@@ -166,8 +166,10 @@ def draw_visualization(state: dict) -> None:
         )
         ax.add_patch(oval)
     else:
-        # Draw lane dividers dynamically from the actual slot y-positions in state
-        slot_ys = sorted(set(slot['y'] for slot in slots))
+        # Draw lane dividers dynamically from the actual slot y-positions in state.
+        # Exclude ramp slots (is_ramp=True) — their y changes every tick and
+        # does not correspond to a road lane centre.
+        slot_ys = sorted(set(slot['y'] for slot in slots if not slot.get('is_ramp', False)))
         half_lane = LANE_WIDTH / 2
         if slot_ys:
             # Outer boundary lines above top lane and below bottom lane
@@ -239,6 +241,34 @@ def draw_visualization(state: dict) -> None:
         ax.text(slot_x, slot_y, str(slot['id']),
                 ha='center', va='center',
                 fontsize=8, color='white', fontweight='bold')
+
+    # Draw scenario overlay (ramp path + merge point marker)
+    scenario_info = state.get('scenario_info', {})
+    if scenario_info.get('phase') not in (None, 'IDLE', 'RUNNING'):
+        merge_pt = scenario_info.get('merge_point')
+        if merge_pt:
+            mpx, mpy = merge_pt['x'], merge_pt['y']
+
+            # Draw on-ramp path as a grey solid line at the configured angle
+            ramp_info = scenario_info.get('ramp')
+            if ramp_info:
+                ramp_angle = ramp_info['angle']   # radians
+                ramp_length = ramp_info['length']  # metres
+                ramp_start_x = mpx - ramp_length * math.cos(ramp_angle)
+                ramp_start_y = mpy - ramp_length * math.sin(ramp_angle)
+                ax.plot([ramp_start_x, mpx], [ramp_start_y, mpy],
+                        color='#888888', linestyle='-', linewidth=3,
+                        alpha=0.45, zorder=2)
+                ax.text(ramp_start_x, ramp_start_y - 0.06, 'ON-RAMP',
+                        ha='center', va='top',
+                        fontsize=7, color='#aaaaaa')
+
+            # Yellow diamond marker at merge point
+            ax.plot(mpx, mpy, marker='D', markersize=10,
+                    color='#ffdd00', markeredgecolor='white',
+                    markeredgewidth=1.5, zorder=5)
+            ax.text(mpx, mpy + 0.08, 'MERGE', ha='center', va='bottom',
+                    fontsize=8, color='#ffdd00', fontweight='bold')
 
     # Draw robots
     robots = state.get('robots', [])
@@ -340,6 +370,32 @@ def main() -> None:
         if last_update > 0:
             elapsed = time.time() - last_update
             st.text(f"Last update: {elapsed:.1f}s ago")
+
+        st.markdown("---")
+
+        # Scenario status
+        scenario_info = state.get('scenario_info', {})
+        if scenario_info:
+            st.subheader("Scenario")
+            sid = scenario_info.get('scenario_id', scenario_info.get('id', 0))
+            name = scenario_info.get('name', 'Free Mode')
+            phase = scenario_info.get('phase') or '—'
+            st.text(f"{'Free Mode' if sid == 0 else 'Scenario ' + str(sid)}: {name}")
+            # Colour-code the phase
+            phase_colors = {
+                'IDLE': ':white_circle:',
+                'APPROACH': ':blue_circle:',
+                'GAP_CHECK': ':orange_circle:',
+                'GAP_CREATE': ':red_circle:',
+                'MERGING': ':yellow_circle:',
+                'MERGED': ':green_circle:',
+                'RUNNING': ':green_circle:',
+            }
+            icon = phase_colors.get(phase, ':white_circle:')
+            st.markdown(f"{icon} Phase: **{phase}**")
+            merge_pt = scenario_info.get('merge_point')
+            if merge_pt:
+                st.text(f"  Merge point: ({merge_pt['x']:.2f}, {merge_pt['y']:.2f})")
 
         st.markdown("---")
 
